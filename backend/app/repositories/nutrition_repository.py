@@ -1,0 +1,236 @@
+from __future__ import annotations
+
+import uuid
+from datetime import date, datetime, timezone
+
+from sqlalchemy import and_, func, select
+from sqlalchemy.orm import Session
+
+from app.models.nutrition import FavoriteMeal, NutritionEntry
+
+
+class NutritionRepository:
+    def create(
+        self,
+        db: Session,
+        *,
+        user_id: uuid.UUID,
+        entry_date: date,
+        meal_type: str,
+        food_name: str,
+        calories: float,
+        protein_g: float | None,
+        carbs_g: float | None,
+        fat_g: float | None,
+        is_shared: bool,
+    ) -> NutritionEntry:
+        entry = NutritionEntry(
+            user_id=user_id,
+            entry_date=entry_date,
+            meal_type=meal_type,
+            food_name=food_name,
+            calories=calories,
+            protein_g=protein_g,
+            carbs_g=carbs_g,
+            fat_g=fat_g,
+            is_shared=is_shared,
+        )
+        db.add(entry)
+        db.flush()
+        return entry
+
+    def list_for_user(
+        self,
+        db: Session,
+        user_id: uuid.UUID,
+        *,
+        entry_date: date | None = None,
+        skip: int = 0,
+        limit: int = 20,
+    ) -> tuple[list[NutritionEntry], int]:
+        base = select(NutritionEntry).where(
+            NutritionEntry.user_id == user_id,
+            NutritionEntry.deleted_at.is_(None),
+        )
+        if entry_date:
+            base = base.where(NutritionEntry.entry_date == entry_date)
+
+        total = db.scalar(select(func.count()).select_from(base.subquery())) or 0
+        rows = db.scalars(
+            base.order_by(
+                NutritionEntry.entry_date.desc(),
+                NutritionEntry.created_at.desc(),
+            )
+            .limit(limit)
+            .offset(skip)
+        ).all()
+        return list(rows), total
+
+    def list_by_date_and_meal_type(
+        self, db: Session, user_id: uuid.UUID, entry_date: date, meal_type: str
+    ) -> list[NutritionEntry]:
+        return list(
+            db.scalars(
+                select(NutritionEntry)
+                .where(
+                    NutritionEntry.user_id == user_id,
+                    NutritionEntry.entry_date == entry_date,
+                    NutritionEntry.meal_type == meal_type,
+                    NutritionEntry.deleted_at.is_(None),
+                )
+                .order_by(NutritionEntry.created_at.asc())
+            ).all()
+        )
+
+    def get_by_id(self, db: Session, entry_id: uuid.UUID) -> NutritionEntry | None:
+        return db.scalar(
+            select(NutritionEntry).where(
+                NutritionEntry.id == entry_id,
+                NutritionEntry.deleted_at.is_(None),
+            )
+        )
+
+    def daily_totals(
+        self, db: Session, user_id: uuid.UUID, entry_date: date
+    ) -> dict:
+        row = db.execute(
+            select(
+                func.count().label("entry_count"),
+                func.coalesce(func.sum(NutritionEntry.calories), 0.0).label("total_calories"),
+                func.coalesce(func.sum(NutritionEntry.protein_g), 0.0).label("total_protein_g"),
+                func.coalesce(func.sum(NutritionEntry.carbs_g), 0.0).label("total_carbs_g"),
+                func.coalesce(func.sum(NutritionEntry.fat_g), 0.0).label("total_fat_g"),
+            ).where(
+                NutritionEntry.user_id == user_id,
+                NutritionEntry.entry_date == entry_date,
+                NutritionEntry.deleted_at.is_(None),
+            )
+        ).one()
+        return row._asdict()
+
+    def calories_by_date_range(
+        self, db: Session, user_id: uuid.UUID, start_date: date, end_date: date
+    ) -> dict[date, float]:
+        rows = db.execute(
+            select(
+                NutritionEntry.entry_date,
+                func.coalesce(func.sum(NutritionEntry.calories), 0.0).label("total"),
+            )
+            .where(
+                NutritionEntry.user_id == user_id,
+                NutritionEntry.entry_date >= start_date,
+                NutritionEntry.entry_date <= end_date,
+                NutritionEntry.deleted_at.is_(None),
+            )
+            .group_by(NutritionEntry.entry_date)
+        ).all()
+        return {r.entry_date: r.total for r in rows}
+
+    def list_logged_dates(self, db: Session, user_id: uuid.UUID) -> list[date]:
+        """Distinct dates with at least one active entry, for streak calculation."""
+        rows = db.execute(
+            select(NutritionEntry.entry_date)
+            .where(
+                NutritionEntry.user_id == user_id,
+                NutritionEntry.deleted_at.is_(None),
+            )
+            .distinct()
+        ).all()
+        return [r.entry_date for r in rows]
+
+    def recent_foods(
+        self, db: Session, user_id: uuid.UUID, limit: int = 20
+    ) -> list[NutritionEntry]:
+        """One entry per unique food_name, ordered by most recently eaten."""
+        subq = (
+            select(
+                NutritionEntry.food_name,
+                func.max(NutritionEntry.created_at).label("latest"),
+            )
+            .where(
+                NutritionEntry.user_id == user_id,
+                NutritionEntry.deleted_at.is_(None),
+            )
+            .group_by(NutritionEntry.food_name)
+            .subquery()
+        )
+        return list(
+            db.scalars(
+                select(NutritionEntry)
+                .join(
+                    subq,
+                    and_(
+                        NutritionEntry.food_name == subq.c.food_name,
+                        NutritionEntry.created_at == subq.c.latest,
+                        NutritionEntry.user_id == user_id,
+                    ),
+                )
+                .order_by(subq.c.latest.desc())
+                .limit(limit)
+            ).all()
+        )
+
+    def soft_delete(self, db: Session, entry: NutritionEntry) -> None:
+        entry.deleted_at = datetime.now(timezone.utc)
+        db.flush()
+
+    # ── Favourites ────────────────────────────────────────────────────────────
+
+    def list_favourites(self, db: Session, user_id: uuid.UUID) -> list[FavoriteMeal]:
+        return list(
+            db.scalars(
+                select(FavoriteMeal)
+                .where(FavoriteMeal.user_id == user_id)
+                .order_by(FavoriteMeal.food_name.asc())
+            ).all()
+        )
+
+    def upsert_favourite(
+        self,
+        db: Session,
+        *,
+        user_id: uuid.UUID,
+        food_name: str,
+        calories: float,
+        protein_g: float | None,
+        carbs_g: float | None,
+        fat_g: float | None,
+    ) -> FavoriteMeal:
+        existing = db.scalar(
+            select(FavoriteMeal).where(
+                FavoriteMeal.user_id == user_id,
+                FavoriteMeal.food_name == food_name,
+            )
+        )
+        if existing:
+            existing.calories = calories
+            existing.protein_g = protein_g
+            existing.carbs_g = carbs_g
+            existing.fat_g = fat_g
+            db.flush()
+            return existing
+        fav = FavoriteMeal(
+            user_id=user_id,
+            food_name=food_name,
+            calories=calories,
+            protein_g=protein_g,
+            carbs_g=carbs_g,
+            fat_g=fat_g,
+        )
+        db.add(fav)
+        db.flush()
+        return fav
+
+    def get_favourite_by_id(
+        self, db: Session, favourite_id: uuid.UUID
+    ) -> FavoriteMeal | None:
+        return db.scalar(
+            select(FavoriteMeal).where(FavoriteMeal.id == favourite_id)
+        )
+
+    def delete_favourite(self, db: Session, fav: FavoriteMeal) -> None:
+        db.delete(fav)
+        db.flush()
+
+
+nutrition_repo = NutritionRepository()

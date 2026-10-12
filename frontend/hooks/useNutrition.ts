@@ -1,0 +1,144 @@
+'use client'
+
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
+import { nutritionApi } from '@/lib/api/nutrition'
+import { getApiErrorMessage } from '@/lib/api/client'
+import { queryKeys } from '@/lib/query/keys'
+import type { FavouriteMealCreateRequest, NutritionCreateRequest } from '@/types/nutrition'
+
+const STALE_2M = 2 * 60 * 1000
+
+export function useNutritionEntries(date: string) {
+  return useQuery({
+    queryKey: queryKeys.nutrition.all({ date }),
+    queryFn: () => nutritionApi.list({ date, limit: 100 }),
+    staleTime: STALE_2M,
+    enabled: Boolean(date),
+  })
+}
+
+export function useDailySummary(date: string) {
+  return useQuery({
+    queryKey: queryKeys.nutrition.dailySummary(date),
+    queryFn: () => nutritionApi.getDailySummary(date),
+    staleTime: STALE_2M,
+    enabled: Boolean(date),
+  })
+}
+
+export function useWeeklySummary() {
+  return useQuery({
+    queryKey: ['nutrition', 'weekly-summary'],
+    queryFn: () => nutritionApi.getWeeklySummary(),
+    staleTime: STALE_2M,
+  })
+}
+
+export function useNutritionStreak() {
+  return useQuery({
+    queryKey: ['nutrition', 'streak'],
+    queryFn: () => nutritionApi.getStreak(),
+    staleTime: STALE_2M,
+  })
+}
+
+export function useFoodSearch(q: string) {
+  return useQuery({
+    queryKey: ['nutrition', 'search', q],
+    queryFn: () => nutritionApi.searchFood(q),
+    staleTime: 10 * 60 * 1000,
+    enabled: q.length >= 2,
+  })
+}
+
+export function useRecentFoods() {
+  return useQuery({
+    queryKey: ['nutrition', 'recent'],
+    queryFn: () => nutritionApi.getRecent(8),
+    staleTime: 5 * 60 * 1000,
+  })
+}
+
+export function useLogMeal() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (data: NutritionCreateRequest) => nutritionApi.create(data),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.nutrition.all({ date: variables.entry_date }) })
+      queryClient.invalidateQueries({ queryKey: queryKeys.nutrition.dailySummary(variables.entry_date) })
+      queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.summary() })
+      queryClient.invalidateQueries({ queryKey: ['nutrition', 'recent'] })
+      queryClient.invalidateQueries({ queryKey: ['nutrition', 'weekly-summary'] })
+      queryClient.invalidateQueries({ queryKey: ['nutrition', 'streak'] })
+    },
+    onError: (error) => toast.error(getApiErrorMessage(error)),
+  })
+}
+
+export function useCalorieGoal() {
+  return useQuery({
+    queryKey: ['nutrition', 'calorie-goal'],
+    queryFn: () => nutritionApi.getCalorieGoal(),
+    staleTime: 10 * 60 * 1000,
+  })
+}
+
+export function useSetCalorieGoal() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (daily_calories: number) => nutritionApi.setCalorieGoal(daily_calories),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['nutrition', 'calorie-goal'] })
+      queryClient.invalidateQueries({ queryKey: ['nutrition', 'weekly-summary'] })
+      toast.success('Calorie goal saved.')
+    },
+    onError: (error) => toast.error(getApiErrorMessage(error)),
+  })
+}
+
+export function useFavouriteMeals() {
+  return useQuery({
+    queryKey: queryKeys.nutrition.favourites(),
+    queryFn: () => nutritionApi.getFavourites(),
+    staleTime: 5 * 60 * 1000,
+  })
+}
+
+export function useAddFavourite() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (data: FavouriteMealCreateRequest) => nutritionApi.addFavourite(data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.nutrition.favourites() })
+    },
+    onError: (error) => toast.error(getApiErrorMessage(error)),
+  })
+}
+
+export function useRemoveFavourite() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) => nutritionApi.removeFavourite(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.nutrition.favourites() })
+    },
+    onError: (error) => toast.error(getApiErrorMessage(error)),
+  })
+}
+
+export function useDeleteMeal(date: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) => nutritionApi.delete(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.nutrition.all({ date }) })
+      queryClient.invalidateQueries({ queryKey: queryKeys.nutrition.dailySummary(date) })
+      queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.summary() })
+      queryClient.invalidateQueries({ queryKey: ['nutrition', 'weekly-summary'] })
+      queryClient.invalidateQueries({ queryKey: ['nutrition', 'streak'] })
+      toast.success('Entry deleted.')
+    },
+    onError: (error) => toast.error(getApiErrorMessage(error)),
+  })
+}

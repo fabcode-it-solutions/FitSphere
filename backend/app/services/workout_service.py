@@ -1,0 +1,315 @@
+from __future__ import annotations
+
+import uuid
+
+from fastapi import HTTPException, status
+from sqlalchemy.orm import Session
+
+from app.models.user import User
+from app.models.workout import WorkoutSession
+from app.repositories.exercise_repository import exercise_repo
+from app.repositories.feed_repository import feed_repo
+from app.repositories.workout_repository import workout_repo
+from app.schemas.workout import (
+    ExerciseHistoryEntry,
+    ExerciseHistoryResponse,
+    ExerciseSetResponse,
+    LoggedExercise,
+    LoggedExercisesResponse,
+    PersonalRecord,
+    PersonalRecordsResponse,
+    WorkoutCreateRequest,
+    WorkoutExerciseResponse,
+    WorkoutListResponse,
+    WorkoutResponse,
+    WorkoutSummary,
+)
+
+
+def _build_response(session: WorkoutSession) -> WorkoutResponse:
+    exercises = [
+        WorkoutExerciseResponse(
+            id=we.id,
+            exercise_id=we.exercise_id,
+            exercise_name=we.exercise.name,
+            muscle_group=we.exercise.muscle_group,
+            order_index=we.order_index,
+            sets=[
+                ExerciseSetResponse(
+                    id=s.id,
+                    set_number=s.set_number,
+                    reps=s.reps,
+                    weight_kg=s.weight_kg,
+                )
+                for s in we.sets
+            ],
+        )
+        for we in session.workout_exercises
+    ]
+    return WorkoutResponse(
+        id=session.id,
+        session_date=session.session_date,
+        name=session.name,
+        notes=session.notes,
+        is_shared=session.is_shared,
+        exercises=exercises,
+        created_at=session.created_at,
+        updated_at=session.updated_at,
+    )
+
+
+def _check_ownership(session: WorkoutSession | None, user_id: uuid.UUID) -> WorkoutSession:
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workout not found")
+    if session.user_id != user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    return session
+
+
+class WorkoutService:
+    def create_workout(
+        self, db: Session, current_user: User, body: WorkoutCreateRequest
+    ) -> WorkoutResponse:
+        # Validate all exercise_ids are accessible (system or owned by this user)
+        for item in body.exercises:
+            ex = exercise_repo.get_by_id(db, item.exercise_id)
+            if ex is None or (not ex.is_system and ex.created_by_user_id != current_user.id):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Exercise {item.exercise_id} not found or not accessible",
+                )
+
+        session = workout_repo.create_session(
+            db,
+            user_id=current_user.id,
+            session_date=body.session_date,
+            name=body.name,
+            notes=body.notes,
+            is_shared=body.is_shared,
+        )
+
+        for idx, item in enumerate(body.exercises):
+            we = workout_repo.add_exercise(
+                db,
+                session_id=session.id,
+                exercise_id=item.exercise_id,
+                order_index=idx,
+            )
+            for s in item.sets:
+                workout_repo.add_set(
+                    db,
+                    workout_exercise_id=we.id,
+                    set_number=s.set_number,
+                    reps=s.reps,
+                    weight_kg=s.weight_kg,
+                )
+
+        # Reload with full relationships for response
+        db.flush()
+        db.refresh(session, ["workout_exercises"])
+        for we in session.workout_exercises:
+            db.refresh(we, ["exercise", "sets"])
+
+        if body.is_shared:
+            feed_repo.create_feed_item(
+                db, user_id=current_user.id, activity_type="workout",
+                workout_session_id=session.id,
+            )
+
+        return _build_response(session)
+
+    def list_workouts(
+        self,
+        db: Session,
+        current_user: User,
+        *,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> WorkoutListResponse:
+        sessions, total = workout_repo.list_for_user(
+            db, current_user.id, limit=limit, offset=offset
+        )
+        summaries = [
+            WorkoutSummary(
+                id=s.id,
+                session_date=s.session_date,
+                name=s.name,
+                is_shared=s.is_shared,
+                exercise_count=len(s.workout_exercises),
+                total_sets=sum(len(we.sets) for we in s.workout_exercises),
+                created_at=s.created_at,
+            )
+            for s in sessions
+        ]
+        return WorkoutListResponse(workouts=summaries, total=total)
+
+    def get_workout(
+        self, db: Session, current_user: User, workout_id: uuid.UUID
+    ) -> WorkoutResponse:
+        session = workout_repo.get_by_id(db, workout_id)
+        _check_ownership(session, current_user.id)
+        return _build_response(session)  # type: ignore[arg-type]
+
+    def update_workout(
+        self, db: Session, current_user: User, workout_id: uuid.UUID, body: WorkoutCreateRequest
+    ) -> WorkoutResponse:
+        session = workout_repo.get_by_id(db, workout_id)
+        _check_ownership(session, current_user.id)
+
+        # Validate exercise access
+        for item in body.exercises:
+            ex = exercise_repo.get_by_id(db, item.exercise_id)
+            if ex is None or (not ex.is_system and ex.created_by_user_id != current_user.id):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Exercise {item.exercise_id} not found or not accessible",
+                )
+
+        old_shared = session.is_shared  # type: ignore[union-attr]
+
+        session.session_date = body.session_date  # type: ignore[union-attr]
+        session.name = body.name  # type: ignore[union-attr]
+        session.notes = body.notes  # type: ignore[union-attr]
+        session.is_shared = body.is_shared  # type: ignore[union-attr]
+
+        # Replace all exercises and sets
+        workout_repo.clear_exercises(db, session)  # type: ignore[arg-type]
+        for idx, item in enumerate(body.exercises):
+            we = workout_repo.add_exercise(
+                db,
+                session_id=session.id,  # type: ignore[union-attr]
+                exercise_id=item.exercise_id,
+                order_index=idx,
+            )
+            for s in item.sets:
+                workout_repo.add_set(
+                    db,
+                    workout_exercise_id=we.id,
+                    set_number=s.set_number,
+                    reps=s.reps,
+                    weight_kg=s.weight_kg,
+                )
+
+        db.flush()
+        db.refresh(session, ["workout_exercises"])
+        for we in session.workout_exercises:  # type: ignore[union-attr]
+            db.refresh(we, ["exercise", "sets"])
+
+        # Sync feed item with sharing state
+        if body.is_shared and not old_shared:
+            feed_repo.create_feed_item(
+                db, user_id=current_user.id, activity_type="workout",
+                workout_session_id=session.id,  # type: ignore[union-attr]
+            )
+        elif not body.is_shared and old_shared:
+            feed_repo.soft_delete_by_workout(db, session.id)  # type: ignore[union-attr]
+
+        return _build_response(session)  # type: ignore[arg-type]
+
+    def delete_workout(
+        self, db: Session, current_user: User, workout_id: uuid.UUID
+    ) -> None:
+        session = workout_repo.get_by_id(db, workout_id)
+        _check_ownership(session, current_user.id)
+        feed_repo.soft_delete_by_workout(db, session.id)  # type: ignore[union-attr]
+        workout_repo.hard_delete(db, session)  # type: ignore[arg-type]
+
+    def logged_exercises(self, db: Session, current_user: User) -> LoggedExercisesResponse:
+        rows = workout_repo.get_logged_exercises(db, current_user.id)
+        exercises = [
+            LoggedExercise(
+                exercise_id=row["exercise_id"],
+                exercise_name=row["exercise_name"],
+                muscle_group=row["muscle_group"],
+                session_count=row["session_count"],
+            )
+            for row in rows
+        ]
+        return LoggedExercisesResponse(exercises=exercises, total=len(exercises))
+
+    def exercise_history(
+        self, db: Session, current_user: User, exercise_id: uuid.UUID
+    ) -> ExerciseHistoryResponse:
+        rows = workout_repo.get_exercise_history(db, current_user.id, exercise_id)
+        if not rows:
+            return ExerciseHistoryResponse(
+                exercise_id=exercise_id,
+                exercise_name="",
+                muscle_group="",
+                entries=[],
+                total_sessions=0,
+            )
+        entries = [
+            ExerciseHistoryEntry(
+                session_date=row["session_date"],
+                max_weight_kg=row["max_weight_kg"],
+                total_sets=row["total_sets"],
+                total_reps=row["total_reps"],
+                total_volume_kg=row["total_volume_kg"],
+            )
+            for row in rows
+        ]
+        return ExerciseHistoryResponse(
+            exercise_id=exercise_id,
+            exercise_name=rows[0]["exercise_name"],
+            muscle_group=rows[0]["muscle_group"],
+            entries=entries,
+            total_sessions=len(entries),
+        )
+
+    def duplicate_workout(
+        self, db: Session, current_user: User, workout_id: uuid.UUID
+    ) -> WorkoutResponse:
+        from datetime import date as date_type
+        original = workout_repo.get_by_id(db, workout_id)
+        _check_ownership(original, current_user.id)
+
+        new_session = workout_repo.create_session(
+            db,
+            user_id=current_user.id,
+            session_date=date_type.today(),
+            name=original.name,  # type: ignore[union-attr]
+            notes=original.notes,  # type: ignore[union-attr]
+            is_shared=False,
+        )
+
+        for we in original.workout_exercises:  # type: ignore[union-attr]
+            new_we = workout_repo.add_exercise(
+                db,
+                session_id=new_session.id,
+                exercise_id=we.exercise_id,
+                order_index=we.order_index,
+            )
+            for s in we.sets:
+                workout_repo.add_set(
+                    db,
+                    workout_exercise_id=new_we.id,
+                    set_number=s.set_number,
+                    reps=s.reps,
+                    weight_kg=s.weight_kg,
+                )
+
+        db.flush()
+        db.refresh(new_session, ["workout_exercises"])
+        for we in new_session.workout_exercises:
+            db.refresh(we, ["exercise", "sets"])
+
+        return _build_response(new_session)
+
+    def personal_records(self, db: Session, current_user: User) -> PersonalRecordsResponse:
+        rows = workout_repo.get_personal_records(db, current_user.id)
+        records = [
+            PersonalRecord(
+                exercise_id=row["exercise_id"],
+                exercise_name=row["exercise_name"],
+                muscle_group=row["muscle_group"],
+                max_weight_kg=row["max_weight_kg"],
+                achieved_on=row["achieved_on"],
+                times_performed=row["times_performed"],
+            )
+            for row in rows
+        ]
+        return PersonalRecordsResponse(records=records, total=len(records))
+
+
+workout_service = WorkoutService()
